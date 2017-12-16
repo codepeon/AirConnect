@@ -1,5 +1,7 @@
 CFLAGS  ?= -Wall -fPIC -ggdb -O2 -m64 $(OPTS) -I/usr/include/i386-linux-gnu $(INCLUDE) $(DEFINES)
-LDFLAGS ?= -s -m64 -lpthread -lssl -lcrypto -ldl -lm -lrt -L. 
+CFLAGS += $(shell pkg-config --cflags-only-I valgrind libupnp flac avahi-client openssl)
+LDFLAGS ?= -s -m64 -lpthread -ldl -lm -lrt -L.
+LDFLAGS += $(shell pkg-config --libs libupnp flac avahi-client openssl)
 
 OBJ					= bin/x86-64
 EXECUTABLE 			= ../bin/airupnp-x86-64

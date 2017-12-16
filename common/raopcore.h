@@ -27,10 +27,13 @@
 typedef enum { RAOP_STREAM, RAOP_PLAY, RAOP_FLUSH, RAOP_PAUSE, RAOP_STOP, RAOP_VOLUME } raop_event_t ;
 typedef void (*raop_cb_t)(void *owner, raop_event_t event, void *param);
 
-struct raop_ctx_s*   raop_create(struct in_addr host, struct mdnsd *svr, char *name,
+struct raop_ctx_s*   raop_create(struct in_addr host, char *name,
 						  char *model, unsigned char mac[6], char *codec, bool drift,
 						  char *latencies, void *owner, raop_cb_t callback);
 void  		  raop_delete(struct raop_ctx_s *ctx);
 void		  raop_notify(struct raop_ctx_s *ctx, raop_event_t event, void *param);
 
+const char *	  raop_get_name(struct raop_ctx_s *ctx);
+const char *	  raop_get_model(struct raop_ctx_s *ctx);
+unsigned short	  raop_get_port(struct raop_ctx_s *ctx);
 #endif

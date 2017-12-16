@@ -1,6 +1,6 @@
 [Unit]
 Description=AirUPnP bridge
-After=network-online.target
+After=network-online.target avahi-daemon.service
 Wants=network-online.target
 
 [Service]

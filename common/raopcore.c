@@ -28,9 +28,7 @@
 #include <openssl/pem.h>
 #include <openssl/engine.h>
 
-#include "mdns.h"
 #include "mdnsd.h"
-#include "mdnssd-itf.h"
 #include "util.h"
 #include "base64.h"
 #include "raopcore.h"
@@ -38,8 +36,10 @@
 #include "log_util.h"
 
 typedef struct raop_ctx_s {
-	struct mdns_service *svc;
-	struct mdnsd *svr;
+	char *id;
+	char *model;
+	void *svc;
+	void *query;
 	struct in_addr host;	// IP of bridge
 	short unsigned port;    // RTSP port for AirPlay
 	int sock;               // socket of the above
@@ -49,7 +49,7 @@ typedef struct raop_ctx_s {
 	bool running;
 	codec_t codec;
 	bool drift;
-	pthread_t thread, search_thread;
+	pthread_t thread;
 	unsigned char mac[6];
 	unsigned int volume_stamp;
 	struct {
@@ -58,6 +58,7 @@ typedef struct raop_ctx_s {
 	} rtsp;
 	struct hairtunes_s *ht;
 	raop_cb_t	callback;
+	struct mdnsd_userdata mdnsd_userdata;
 	struct {
 		char				DACPid[32], id[32];
 		struct in_addr		host;
@@ -76,13 +77,31 @@ static bool 	handle_rtsp(raop_ctx_t *ctx, int sock);
 static char*	rsa_apply(unsigned char *input, int inlen, int *outlen, int mode);
 static int  	base64_pad(char *src, char **padded);
 static void 	hairtunes_cb(void *owner, hairtunes_event_t event);
-static void* 	search_remote(void *args);
+static void 	search_remote(bool error, char *name, char *address, short port, void *userdata);
 
-extern char private_key[];
 enum { RSA_MODE_KEY, RSA_MODE_AUTH };
 
+
+const char *raop_get_name(struct raop_ctx_s *ctx) {
+	return ctx->id;
+}
+
+const char *raop_get_model(struct raop_ctx_s *ctx) {
+	return ctx->model;
+}
+
+unsigned short raop_get_port(struct raop_ctx_s *ctx) {
+	return ctx->port;
+}
+
+static void publish_error(void *userdata) {
+	raop_ctx_t *ctx = (raop_ctx_t *)userdata;
+	mdnsd_free_handle(ctx->svc, false);
+	ctx->svc = mdnsd_register_service(&ctx->mdnsd_userdata, false);
+}
+
 /*----------------------------------------------------------------------------*/
-struct raop_ctx_s *raop_create(struct in_addr host, struct mdnsd *svr, char *name,
+struct raop_ctx_s *raop_create(struct in_addr host, char *name,
 						char *model, unsigned char mac[6], char *codec, bool drift,
 						char *latencies, void *owner, raop_cb_t callback) {
 	struct raop_ctx_s *ctx = malloc(sizeof(struct raop_ctx_s));
@@ -90,10 +109,6 @@ struct raop_ctx_s *raop_create(struct in_addr host, struct mdnsd *svr, char *nam
 	socklen_t nlen = sizeof(struct sockaddr);
 	char *id;
 	int i;
-	char *txt[] = { NULL, "tp=UDP", "sm=false", "sv=false", "ek=1",
-					"et=0,1", "md=0,1,2", "cn=0,1", "ch=2",
-					"ss=16", "sr=44100", "vn=3", "txtvers=1",
-					NULL };
 
 	if (!ctx) return NULL;
 
@@ -133,10 +148,6 @@ struct raop_ctx_s *raop_create(struct in_addr host, struct mdnsd *svr, char *nam
 	ctx->host = host;
 
 	// set model
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wunused-result"
-	asprintf(&(txt[0]), "am=%s", model);
-#pragma GCC diagnostic pop
 	id = malloc(strlen(name) + 12 + 1 + 1);
 
 	memcpy(ctx->mac, mac, 6);
@@ -146,11 +157,13 @@ struct raop_ctx_s *raop_create(struct in_addr host, struct mdnsd *svr, char *nam
 	// Windows snprintf does not add NULL if string is larger than n ...
 	if (strlen(id) > 63) id[63] = '\0';
 
-	ctx->svr = svr;
-	ctx->svc = mdnsd_register_svc(svr, id, "_raop._tcp.local", ctx->port, NULL, (const char**) txt);
+	ctx->id = id;
+	ctx->model = strdup(model);
 
-	free(txt[0]);
-	free(id);
+	ctx->mdnsd_userdata.ctx = ctx;
+	ctx->mdnsd_userdata.query_cb = search_remote;
+	ctx->mdnsd_userdata.error_cb = publish_error;
+	ctx->svc = mdnsd_register_service(&ctx->mdnsd_userdata, true);
 
 	ctx->running = true;
 	pthread_create(&ctx->thread, NULL, &rtsp_thread, ctx);
@@ -177,17 +190,20 @@ void raop_delete(struct raop_ctx_s *ctx) {
 #endif
 	closesocket(ctx->sock);
 
-	// terminate search, but do not reclaim memory of pthread if never launched
-	if (ctx->active_remote.handle) {
-		close_mDNS(ctx->active_remote.handle);
-		pthread_join(ctx->search_thread, NULL);
+	if (ctx->svc) {
+		mdnsd_free_handle(ctx->svc, true);
 	}
+	if (ctx->query) {
+		mdnsd_free_handle(ctx->query, true);
+		ctx->query = NULL;
+	}
+
+	free(ctx->id);
+	free(ctx->model);
 
 	NFREE(ctx->rtsp.aeskey);
 	NFREE(ctx->rtsp.aesiv);
 	NFREE(ctx->rtsp.fmtp);
-
-	mdns_service_remove(ctx->svr, ctx->svc);
 
 	free(ctx);
 }
@@ -409,8 +425,7 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 		if ((buf = kd_lookup(headers, "DACP-ID")) != NULL) strcpy(ctx->active_remote.DACPid, buf);
 		if ((buf = kd_lookup(headers, "Active-Remote")) != NULL) strcpy(ctx->active_remote.id, buf);
 
-		ctx->active_remote.handle = init_mDNS(false, ctx->host);
-		pthread_create(&ctx->search_thread, NULL, &search_remote, ctx);
+		ctx->query = mdnsd_query_new(&ctx->mdnsd_userdata, true);
 
 	} else if (!strcmp(method, "SETUP") && ((buf = kd_lookup(headers, "Transport")) != NULL)) {
 		char *p;
@@ -470,9 +485,11 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 		ctx->ht = NULL;
 		ctx->hport = -1;
 
-		// need to make sure no search is on-going and reclaim pthread memory
-		if (ctx->active_remote.handle) close_mDNS(ctx->active_remote.handle);
-		pthread_join(ctx->search_thread, NULL);
+		// need to make sure no search is on-going
+		if (ctx->query) {
+			mdnsd_free_handle(ctx->query, true);
+			ctx->query = NULL;
+		}
 		memset(&ctx->active_remote, 0, sizeof(ctx->active_remote));
 
 		NFREE(ctx->rtsp.aeskey);
@@ -533,34 +550,19 @@ static void hairtunes_cb(void *owner, hairtunes_event_t event)
 
 
 /*----------------------------------------------------------------------------*/
-bool search_remote_cb(mDNSservice_t *slist, void *cookie, bool *stop) {
-	mDNSservice_t *s;
-	raop_ctx_t *ctx = (raop_ctx_t*) cookie;
-
-	// see if we have found an active remote for our ID
-	for (s = slist; s; s = s->next) {
-		if (stristr(s->name, ctx->active_remote.DACPid)) {
-			ctx->active_remote.host = s->addr;
-			ctx->active_remote.port = s->port;
-			LOG_INFO("[%p]: found ActiveRemote for %s at %s:%u", ctx, ctx->active_remote.DACPid,
-								inet_ntoa(ctx->active_remote.host), ctx->active_remote.port);
-			*stop = true;
-			break;
-		}
+static void search_remote(bool error, char *name, char *address, short port, void *userdata) {
+	raop_ctx_t *ctx = userdata;
+	if (error) {
+		mdnsd_free_handle(ctx->query, false);
+		ctx->query = NULL;
+	} else if (stristr(name, ctx->active_remote.DACPid)) {
+		inet_aton(address, &ctx->active_remote.host);
+		ctx->active_remote.port = port;
+		LOG_INFO("[%p]: found ActiveRemote for %s at %s:%u", ctx, ctx->active_remote.DACPid,
+				inet_ntoa(ctx->active_remote.host), ctx->active_remote.port);
+		mdnsd_free_handle(ctx->query, false);
+		ctx->query = NULL;
 	}
-
-	// let caller clear list
-	return false;
-}
-
-
-/*----------------------------------------------------------------------------*/
-static void* search_remote(void *args) {
-	raop_ctx_t *ctx = (raop_ctx_t*) args;
-
-	query_mDNS(ctx->active_remote.handle, "_dacp._tcp.local", 0, 0, &search_remote_cb, (void*) ctx);
-
-	return NULL;
 }
 
 

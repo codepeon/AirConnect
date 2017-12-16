@@ -114,7 +114,6 @@ static bool	   			glDaemonize = false;
 static bool				glMainRunning = true;
 static struct in_addr 	glHost;
 static char				glHostName[_STR_LEN_];
-static struct mdnsd*	glmDNSServer = NULL;
 static char*			glExcluded = NULL;
 static char				*glPidFile = NULL;
 static bool				glAutoSaveConfigFile = false;
@@ -730,7 +729,7 @@ static void *UpdateThread(void *args)
 
 				if (AddMRDevice(Device, UDN, DescDoc, Update->Data) && !glDiscovery) {
 					// create a new AirPlay
-					Device->Raop = raop_create(glHost, glmDNSServer, Device->Config.Name,
+					Device->Raop = raop_create(glHost, Device->Config.Name,
 									   "airupnp", Device->Config.mac, Device->Config.Codec,
 									   glDrift, Device->Config.Latency, Device, callback);
 					if (!Device->Raop) {
@@ -959,7 +958,7 @@ static bool Start(void)
 	}
 
 	snprintf(hostname, _STR_LEN_, "%s.local", glHostName);
-	if ((glmDNSServer = mdnsd_start(glHost)) == NULL) {
+	if (-1 == mdnsd_start()) {
 		UpnpFinish();
 		return false;
 	}
@@ -972,8 +971,6 @@ static bool Start(void)
 	QueueInit(&glUpdateQueue, true, FreeUpdate);
 	pthread_create(&glMainThread, NULL, &MainThread, NULL);
 	pthread_create(&glUpdateThread, NULL, &UpdateThread, NULL);
-
-	mdnsd_set_hostname(glmDNSServer, hostname, glHost);
 
 	UpnpSearchAsync(glControlPointHandle, DISCOVERY_TIME, MEDIA_RENDERER, NULL);
 
@@ -1017,7 +1014,7 @@ static bool Stop(void)
 	QueueFlush(&glUpdateQueue);
 
 	// stop broadcasting devices
-	mdnsd_stop(glmDNSServer);
+	mdnsd_stop();
 
 	if (glConfigID) ixmlDocument_free(glConfigID);
 
